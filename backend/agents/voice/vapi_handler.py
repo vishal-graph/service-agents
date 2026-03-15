@@ -72,28 +72,37 @@ async def vapi_chat_completions(request: Request):
     Vapi Custom LLM endpoint.
     Vapi calls this to get the next assistant message.
     It expects an OpenAI-compatible /chat/completions response.
+    Supports both streaming (SSE) and non-streaming responses.
     """
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    is_streaming = body.get("stream", False)
+
     # Find the latest user message
     messages = body.get("messages", [])
     if not messages:
-        return _openai_response("Hello.")
+        return _build_response(OPENING_VOICE_MESSAGE, is_streaming)
 
     last_user_msg = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
-            last_user_msg = msg.get("content", "").strip()
+            content = msg.get("content", "")
+            # content can be a string or a list of content parts
+            if isinstance(content, list):
+                last_user_msg = " ".join(
+                    part.get("text", "") for part in content if isinstance(part, dict)
+                ).strip()
+            else:
+                last_user_msg = content.strip()
             break
 
     if not last_user_msg:
-        # If no user message was found, might be the initial system ping or startup
-        return _openai_response(OPENING_VOICE_MESSAGE)
+        return _build_response(OPENING_VOICE_MESSAGE, is_streaming)
 
-    # Build session ID from call data inside the Custom LLM payload payload
+    # Build session ID from call data
     call = body.get("call", {})
     call_id = call.get("id", "unknown_call")
     phone = call.get("customer", {}).get("number", call_id)
@@ -126,7 +135,7 @@ async def vapi_chat_completions(request: Request):
                         data={"error": str(e), "phase": "vapi_custom_llm"})
         fallback = "Could you give me just a moment, I'm pulling up your details."
         await save_session(session)
-        return _openai_response(fallback)
+        return _build_response(fallback, is_streaming)
 
     # Optimize for voice
     voice_text = optimize_for_voice(agent_response.text)
@@ -143,11 +152,18 @@ async def vapi_chat_completions(request: Request):
         except Exception:
             pass
 
-    return _openai_response(voice_text)
+    return _build_response(voice_text, is_streaming)
+
+
+def _build_response(text: str, stream: bool = False):
+    """Return either an SSE stream or a plain JSON response."""
+    if stream:
+        return _openai_stream_response(text)
+    return _openai_response(text)
 
 
 def _openai_response(text: str) -> dict:
-    """Format the response exactly how Vapi Custom LLM expects it."""
+    """Format the response exactly how Vapi Custom LLM expects it (non-streaming)."""
     return {
         "id": f"chatcmpl-aadhya-{int(datetime.utcnow().timestamp())}",
         "object": "chat.completion",
@@ -162,6 +178,68 @@ def _openai_response(text: str) -> dict:
             "finish_reason": "stop"
         }]
     }
+
+
+def _openai_stream_response(text: str):
+    """Return an SSE streaming response compatible with OpenAI chat completions."""
+    import json
+    from fastapi.responses import StreamingResponse
+
+    chunk_id = f"chatcmpl-aadhya-{int(datetime.utcnow().timestamp())}"
+    created = int(datetime.utcnow().timestamp())
+
+    def generate():
+        # First chunk: role
+        chunk1 = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": "aadhya-backend",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None
+            }]
+        }
+        yield f"data: {json.dumps(chunk1)}\n\n"
+
+        # Second chunk: full content
+        chunk2 = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": "aadhya-backend",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": text},
+                "finish_reason": None
+            }]
+        }
+        yield f"data: {json.dumps(chunk2)}\n\n"
+
+        # Final chunk: stop
+        chunk3 = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": "aadhya-backend",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }
+        yield f"data: {json.dumps(chunk3)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
 
 
 def _assistant_config_response(opening_message: str) -> dict:
