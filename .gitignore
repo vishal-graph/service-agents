@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.idea/
+.vscode/
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Logs
+logs/
+*.log
+
+# Redis/Supabase local
+.upstash
+supabase/
+
+# OS
+.DS_Store
+Thumbs.db
