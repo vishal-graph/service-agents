@@ -39,63 +39,10 @@ async def vapi_webhook(request: Request):
 
     # ─── Handle transcripts ───────────────────────────────────────────────
     if msg_type == "transcript":
-        role = message.get("role", "")
-        transcript = message.get("transcript", "").strip()
-
-        if role != "user" or not transcript:
-            return {"results": []}
-
-        # Build session ID from call data
-        call = body.get("call", {})
-        call_id = call.get("id", "unknown_call")
-        phone = call.get("customer", {}).get("number", call_id)
-        session_id = f"voice_{call_id}"
-
-        # Load or create session
-        session = await get_session(session_id)
-        if session is None:
-            session = Session(
-                session_id=session_id,
-                phone_number=phone,
-                channel="voice",
-                conversation_stage=ConversationStage.DISCOVERY,
-                created_at=datetime.utcnow(),
-                last_active=datetime.utcnow(),
-            )
-            await log_event("SESSION_START", session_id=session_id,
-                            data={"phone": phone, "channel": "voice"})
-
-        # Route through controller
-        controller = get_controller()
-        try:
-            agent_response = await controller.process_message(
-                session=session,
-                user_message=transcript,
-                channel="voice",
-            )
-        except Exception as e:
-            await log_event("API_ERROR", session_id=session_id,
-                            data={"error": str(e), "phase": "vapi_handler"})
-            fallback = "Could you give me just a moment, I'm pulling up your details."
-            await save_session(session)
-            return _say_response(fallback)
-
-        # Optimize for voice
-        voice_text = optimize_for_voice(agent_response.text)
-
-        # Persist
-        await save_session(agent_response.session)
-
-        if agent_response.summary_generated and agent_response.session.summary:
-            await supabase_store.save_enquiry(agent_response.session)
-            try:
-                from backend.schemas.summary import ProjectSummary
-                summary_obj = ProjectSummary.model_validate(agent_response.session.summary)
-                await supabase_store.save_summary(summary_obj, phone_number=phone)
-            except Exception:
-                pass
-
-        return _say_response(voice_text)
+        # We no longer process AI logic here, because Vapi Custom LLM
+        # sends requests directly to the /chat/completions endpoint.
+        # This event is just for monitoring if needed.
+        return {"results": []}
 
     # ─── Handle end-of-call ───────────────────────────────────────────────
     if msg_type == "end-of-call-report":
@@ -115,6 +62,104 @@ def _say_response(text: str) -> dict:
         "results": [{
             "toolCallId": "aadhya_response",
             "result": text,
+        }]
+    }
+
+
+@router.post("/webhook/vapi/chat/completions")
+async def vapi_chat_completions(request: Request):
+    """
+    Vapi Custom LLM endpoint.
+    Vapi calls this to get the next assistant message.
+    It expects an OpenAI-compatible /chat/completions response.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Find the latest user message
+    messages = body.get("messages", [])
+    if not messages:
+        return _openai_response("Hello.")
+
+    last_user_msg = None
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            last_user_msg = msg.get("content", "").strip()
+            break
+
+    if not last_user_msg:
+        # If no user message was found, might be the initial system ping or startup
+        return _openai_response(OPENING_VOICE_MESSAGE)
+
+    # Build session ID from call data inside the Custom LLM payload payload
+    call = body.get("call", {})
+    call_id = call.get("id", "unknown_call")
+    phone = call.get("customer", {}).get("number", call_id)
+    session_id = f"voice_{call_id}"
+
+    # Load or create session
+    session = await get_session(session_id)
+    if session is None:
+        session = Session(
+            session_id=session_id,
+            phone_number=phone,
+            channel="voice",
+            conversation_stage=ConversationStage.DISCOVERY,
+            created_at=datetime.utcnow(),
+            last_active=datetime.utcnow(),
+        )
+        await log_event("SESSION_START", session_id=session_id,
+                        data={"phone": phone, "channel": "voice"})
+
+    # Route through controller
+    controller = get_controller()
+    try:
+        agent_response = await controller.process_message(
+            session=session,
+            user_message=last_user_msg,
+            channel="voice",
+        )
+    except Exception as e:
+        await log_event("API_ERROR", session_id=session_id,
+                        data={"error": str(e), "phase": "vapi_custom_llm"})
+        fallback = "Could you give me just a moment, I'm pulling up your details."
+        await save_session(session)
+        return _openai_response(fallback)
+
+    # Optimize for voice
+    voice_text = optimize_for_voice(agent_response.text)
+
+    # Persist
+    await save_session(agent_response.session)
+
+    if agent_response.summary_generated and agent_response.session.summary:
+        await supabase_store.save_enquiry(agent_response.session)
+        try:
+            from backend.schemas.summary import ProjectSummary
+            summary_obj = ProjectSummary.model_validate(agent_response.session.summary)
+            await supabase_store.save_summary(summary_obj, phone_number=phone)
+        except Exception:
+            pass
+
+    return _openai_response(voice_text)
+
+
+def _openai_response(text: str) -> dict:
+    """Format the response exactly how Vapi Custom LLM expects it."""
+    return {
+        "id": f"chatcmpl-aadhya-{int(datetime.utcnow().timestamp())}",
+        "object": "chat.completion",
+        "created": int(datetime.utcnow().timestamp()),
+        "model": "aadhya-backend",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": text
+            },
+            "finish_reason": "stop"
         }]
     }
 
