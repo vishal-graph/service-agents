@@ -59,10 +59,11 @@ class GeminiEngine:
         """
         return await with_retry(
             self._chat_once,
+            session_id,
+            user_message,
+            system_prompt,
+            history,
             session_id=session_id,
-            user_message=user_message,
-            system_prompt=system_prompt,
-            history=history,
         )
 
     async def _chat_once(
