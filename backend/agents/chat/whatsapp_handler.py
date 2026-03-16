@@ -66,6 +66,31 @@ async def whatsapp_webhook(
 
     # Load or create session
     session = await get_session(session_id)
+
+    # ─── RESTART45: Reset session for testing ─────────────────────────────
+    if user_message.upper() == "RESTART45":
+        # Delete existing session from Redis
+        from backend.storage.redis_store import get_redis_store
+        store = get_redis_store()
+        await store.delete_session(session_id)
+        await log_event("SESSION_RESET", session_id=session_id,
+                        data={"reason": "RESTART45_command"})
+        reset_msg = (
+            "🔄 Session reset! Starting fresh.\n\n"
+            + OPENING_CHAT_MESSAGE
+        )
+        # Create a brand new session
+        new_session = Session(
+            session_id=session_id,
+            phone_number=phone_number,
+            channel="whatsapp",
+            conversation_stage=ConversationStage.DISCOVERY,
+            created_at=datetime.utcnow(),
+            last_active=datetime.utcnow(),
+        )
+        await save_session(new_session)
+        return Response(content=twiml_response(reset_msg), media_type="application/xml")
+
     if session is None:
         session = Session(
             session_id=session_id,

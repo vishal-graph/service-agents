@@ -117,6 +117,7 @@ class GeminiEngine:
         Returns parsed dict or {} on failure.
         """
         import asyncio
+        import re
         try:
             client = _get_client()
             config = types.GenerateContentConfig(
@@ -134,11 +135,64 @@ class GeminiEngine:
                 )
             )
             text = response.text.strip() if response.text else "{}"
-            return json.loads(text)
+            return self._safe_parse_json(text)
         except (json.JSONDecodeError, Exception) as e:
             await log_event("API_ERROR", session_id=session_id,
                             data={"error": str(e), "phase": "json_extraction"})
             return {}
+
+    def _safe_parse_json(self, text: str) -> dict:
+        """
+        Robust JSON parser with multiple fallback strategies.
+        Gemini 3 Flash Preview sometimes returns slightly malformed JSON.
+        """
+        import re
+
+        # Strategy 1: Direct parse
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: Extract from markdown code fences
+        fence_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+        if fence_match:
+            try:
+                return json.loads(fence_match.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 3: Find the first {...} block in the text
+        brace_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+        if brace_match:
+            try:
+                return json.loads(brace_match.group(0))
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 4: Try to find nested JSON with balanced braces
+        depth = 0
+        start = None
+        for i, ch in enumerate(text):
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidate = text[start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        pass
+
+        # Strategy 5: Extract key-value pairs via regex as last resort
+        result = {}
+        kv_pattern = re.compile(r'"(\w+)"\s*:\s*"([^"]*)"')
+        for match in kv_pattern.finditer(text):
+            result[match.group(1)] = match.group(2)
+        return result
 
     def build_history(self, conversation_history: list) -> list[dict]:
         """
